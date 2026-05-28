@@ -1,12 +1,13 @@
 """Native llama.cpp binary launcher for GPU-accelerated local inference.
 
-Finds llama-server.exe / llama-cli.exe on the system and generates
+Finds llama-server and llama-cli (.exe on Windows) on the system and generates
 optimised argument lists based on detected hardware and model file size.
 """
 
 from __future__ import annotations
 
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -14,15 +15,28 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+_IS_WINDOWS = platform.system() == "Windows"
 
-_KNOWN_LLAMA_DIRS = [
-    Path(r"C:\tools\llama-cpp"),
-    Path(r"C:\tools\llama.cpp"),
-    Path(r"C:\llama-cpp"),
-    Path(r"C:\llama.cpp"),
-]
+if _IS_WINDOWS:
+    _KNOWN_LLAMA_DIRS = [
+        Path(r"C:\tools\llama-cpp"),
+        Path(r"C:\tools\llama.cpp"),
+        Path(r"C:\llama-cpp"),
+        Path(r"C:\llama.cpp"),
+    ]
+else:
+    _KNOWN_LLAMA_DIRS = [
+        Path("/usr/local/bin"),
+        Path("/usr/bin"),
+        Path("/opt/llama.cpp/bin"),
+        Path.home() / ".local" / "bin",
+        Path.home() / "llama.cpp" / "bin",
+        Path.home() / "llama.cpp" / "build" / "bin",
+    ]
 
 _ENV_LLAMA_DIR = "WHICHLLM_LLAMA_DIR"
+_SERVER_BIN = "llama-server.exe" if _IS_WINDOWS else "llama-server"
+_CLI_BIN = "llama-cli.exe" if _IS_WINDOWS else "llama-cli"
 
 # Bytes-per-weight lookup (same source as constants.py)
 _BYTES_PER_WEIGHT: dict[str, float] = {
@@ -60,7 +74,7 @@ class FoundBinaries:
 
 
 def find_binaries() -> FoundBinaries:
-    """Locate llama-server.exe and llama-cli.exe on the system.
+    """Locate llama-server and llama-cli (.exe on Windows) on the system.
 
     Checks, in order:
       1. WHICHLLM_LLAMA_DIR env var
@@ -72,7 +86,8 @@ def find_binaries() -> FoundBinaries:
     candidates: list[Path] = []
     env_dir = os.environ.get(_ENV_LLAMA_DIR)
     if env_dir:
-        candidates.append(Path(env_dir))
+        env_path = Path(env_dir)
+        candidates.append(env_path.parent if env_path.is_file() else env_path)
     candidates.extend(_KNOWN_LLAMA_DIRS)
 
     for base in candidates:
@@ -80,11 +95,11 @@ def find_binaries() -> FoundBinaries:
         if not base.is_dir():
             continue
         if not result.server:
-            s = base / "llama-server.exe"
+            s = base / _SERVER_BIN
             if s.is_file():
                 result.server = s
         if not result.cli:
-            c = base / "llama-cli.exe"
+            c = base / _CLI_BIN
             if c.is_file():
                 result.cli = c
         if result.server and result.cli:
@@ -92,11 +107,11 @@ def find_binaries() -> FoundBinaries:
 
     # Fallback: check PATH
     if not result.server:
-        s = shutil.which("llama-server.exe")
+        s = shutil.which(_SERVER_BIN)
         if s:
             result.server = Path(s)
     if not result.cli:
-        c = shutil.which("llama-cli.exe")
+        c = shutil.which(_CLI_BIN)
         if c:
             result.cli = Path(c)
 

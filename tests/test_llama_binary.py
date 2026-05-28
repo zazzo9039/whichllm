@@ -1,10 +1,13 @@
 """Tests for native llama.cpp binary helpers."""
 
+import platform
 from pathlib import Path
 
 import pytest
 
 from whichllm.engine.llama_binary import (
+    _CLI_BIN,
+    _SERVER_BIN,
     extract_quant,
     find_binaries,
     launch_params_for_gguf,
@@ -112,3 +115,33 @@ def test_find_binaries_returns_dataclass():
     result = find_binaries()
     assert hasattr(result, "server")
     assert hasattr(result, "cli")
+
+
+def test_find_binaries_finds_unix_names(tmp_path, monkeypatch):
+    server = tmp_path / _SERVER_BIN
+    cli = tmp_path / _CLI_BIN
+    server.touch()
+    cli.touch()
+    monkeypatch.setenv("WHICHLLM_LLAMA_DIR", str(tmp_path))
+
+    result = find_binaries()
+
+    assert result.server == server
+    assert result.cli == cli
+
+
+def test_find_binaries_env_points_to_file(tmp_path, monkeypatch):
+    server = tmp_path / _SERVER_BIN
+    cli = tmp_path / _CLI_BIN
+    server.touch()
+    cli.touch()
+    monkeypatch.setenv("WHICHLLM_LLAMA_DIR", str(server))
+
+    result = find_binaries()
+
+    assert result.server == server
+    assert result.cli == cli
+
+
+def test_server_bin_has_exe_only_on_windows():
+    assert _SERVER_BIN.endswith(".exe") == (platform.system() == "Windows")
