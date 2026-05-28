@@ -729,6 +729,31 @@ def _resolve_ranked_gguf_for_run(
     return model, variant
 
 
+def _resolve_gguf_runtime(
+    selected_model: ModelInfo,
+    models: list[ModelInfo],
+    quant_filter: str | None = None,
+) -> tuple[ModelInfo, GGUFVariant] | None:
+    """Find a runnable GGUF repo/file for an explicitly selected model.
+
+    Official HuggingFace repos are often safetensors-only. When the selected
+    model has no ``gguf_variants``, look for a GGUF sibling in the same family
+    (e.g. ``Qwen/Qwen3-14B`` -> ``unsloth/Qwen3-14B-GGUF``).
+    """
+    if selected_model.gguf_variants:
+        variant = _pick_gguf_variant(selected_model, quant_filter)
+        return (selected_model, variant) if variant else None
+
+    placeholder = GGUFVariant(
+        filename="",
+        quant_type=quant_filter or "Q4_K_M",
+        file_size_bytes=0,
+    )
+    return _resolve_ranked_gguf_for_run(
+        selected_model, placeholder, models, quant_filter=quant_filter
+    )
+
+
 def _resolve_model_deps(model, variant) -> tuple[list[str], str]:
     """Determine pip dependencies and script type for a model.
 
@@ -854,6 +879,322 @@ finally:
 '''
 
 
+def _generate_serve_script(
+    model_path: str,
+    model_id: str,
+    quant_type: str | None,
+    host: str,
+    port: int,
+    context_length: int,
+    cpu_only: bool,
+) -> str:
+    """Generate a self-contained OpenAI-compatible API server script."""
+    n_gpu = 0 if cpu_only else -1
+    quant_comment = f" ({quant_type})" if quant_type else ""
+    model_label = model_id or model_path
+    return f'''\
+import json
+import os
+import uvicorn
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse, JSONResponse
+from huggingface_hub import hf_hub_download
+from llama_cpp import Llama
+from pydantic import BaseModel
+
+app = FastAPI(title="whichllm API", version="0.1.0")
+_host = "{host}"
+_port = {port}
+
+print("Loading {model_label}{quant_comment}...")
+_is_local = os.path.exists(r"{model_path}")
+if _is_local:
+    model_file = r"{model_path}"
+else:
+    model_file = hf_hub_download(
+        repo_id="{model_id}",
+        filename=r"{model_path}",
+    )
+
+llm = Llama(
+    model_path=model_file,
+    n_ctx={context_length},
+    n_gpu_layers={n_gpu},
+    verbose=False,
+)
+print(f"Server ready at http://{{_host}}:{{_port}}")
+
+
+class Message(BaseModel):
+    role: str
+    content: str
+
+
+class ChatCompletionRequest(BaseModel):
+    model: str = "{model_label}"
+    messages: list[Message]
+    temperature: float = 0.7
+    max_tokens: int = 512
+    stream: bool = False
+
+
+class CompletionRequest(BaseModel):
+    model: str = "{model_label}"
+    prompt: str
+    temperature: float = 0.7
+    max_tokens: int = 512
+    stream: bool = False
+
+
+@app.get("/v1/models")
+async def list_models():
+    return {{
+        "object": "list",
+        "data": [
+            {{"id": "{model_label}", "object": "model", "created": 0, "owned_by": "whichllm"}}
+        ],
+    }}
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(req: ChatCompletionRequest):
+    messages = [{{"role": m.role, "content": m.content}} for m in req.messages]
+
+    if req.stream:
+        async def generate():
+            response = llm.create_chat_completion(
+                messages=messages,
+                temperature=req.temperature,
+                max_tokens=req.max_tokens,
+                stream=True,
+            )
+            for chunk in response:
+                yield f"data: {{json.dumps(chunk)}}\\n\\n"
+            yield "data: [DONE]\\n\\n"
+        return StreamingResponse(generate(), media_type="text/event-stream")
+
+    response = llm.create_chat_completion(
+        messages=messages,
+        temperature=req.temperature,
+        max_tokens=req.max_tokens,
+        stream=False,
+    )
+    return JSONResponse(response)
+
+
+@app.post("/v1/completions")
+async def completions(req: CompletionRequest):
+    if req.stream:
+        async def generate():
+            response = llm(
+                prompt=req.prompt,
+                temperature=req.temperature,
+                max_tokens=req.max_tokens,
+                stream=True,
+            )
+            for chunk in response:
+                yield f"data: {{json.dumps(chunk)}}\\n\\n"
+            yield "data: [DONE]\\n\\n"
+        return StreamingResponse(generate(), media_type="text/event-stream")
+
+    response = llm(
+        prompt=req.prompt,
+        temperature=req.temperature,
+        max_tokens=req.max_tokens,
+        stream=False,
+    )
+    return JSONResponse(response)
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host=_host, port=_port)
+'''
+
+
+def _compatibility_from_local(local_model) -> "CompatibilityResult":
+    from whichllm.engine.types import CompatibilityResult
+
+    family_id = local_model.family_id or local_model.name.lower()
+    model = ModelInfo(
+        id=local_model.name,
+        family_id=family_id,
+        name=local_model.name,
+        parameter_count=0,
+        downloads=0,
+        likes=0,
+    )
+    variant = None
+    if local_model.is_gguf:
+        variant = GGUFVariant(
+            filename=local_model.path.name,
+            quant_type=local_model.quant_type or "Q4_K_M",
+            file_size_bytes=local_model.size_bytes,
+        )
+    return CompatibilityResult(
+        model=model,
+        gguf_variant=variant,
+        can_run=True,
+        vram_required_bytes=0,
+        vram_available_bytes=0,
+        is_local=True,
+    )
+
+
+def _attach_local_flag(result, local_models) -> None:
+    local_ids = {m.family_id for m in local_models if m.family_id}
+    if result.model.family_id in local_ids:
+        result.is_local = True
+
+
+def _resolve_launch_result(ranked, all_models, quant_filter: str | None = None):
+    from dataclasses import replace
+
+    from whichllm.engine.types import CompatibilityResult
+
+    if ranked.gguf_variant:
+        resolved = _resolve_ranked_gguf_for_run(
+            ranked.model,
+            ranked.gguf_variant,
+            all_models,
+            quant_filter=quant_filter,
+        )
+        if resolved:
+            model, variant = resolved
+            return replace(ranked, model=model, gguf_variant=variant)
+
+    variant = _pick_gguf_variant(ranked.model, quant_filter)
+    if variant:
+        return replace(ranked, gguf_variant=variant)
+    return None
+
+
+def _pick_first_ranked_gguf_result(results, all_models, quant_filter: str | None = None):
+    for ranked in results:
+        resolved = _resolve_launch_result(ranked, all_models, quant_filter)
+        if resolved:
+            return resolved
+    return None
+
+
+def _print_launch_plan(plan, hardware, host: str = "localhost", port: int = 8000) -> None:
+    from whichllm.engine.launch_plan import LaunchPlan
+
+    assert isinstance(plan, LaunchPlan)
+    vram_gb = max((g.vram_bytes for g in hardware.gpus), default=0) / (1024**3)
+    source_label = "local" if plan.model_source == "local" else "HuggingFace"
+    local_tag = " [green]✓ local[/]" if plan.model_source == "local" else ""
+
+    if plan.target == "server":
+        console.print(f"\n[bold green]llama-server[/]{local_tag}")
+        console.print(f"  Model: {plan.model_id}")
+        console.print(f"  Source: {source_label}")
+        if plan.model_source == "local":
+            console.print(f"  Path: {plan.model_path}")
+        else:
+            console.print(f"  File: {plan.model_path}")
+        if plan.quant_type:
+            console.print(f"  Quant: {plan.quant_type}")
+        console.print(f"  API base: [bold]http://{host}:{port}/v1[/]")
+        console.print(f"  VRAM: {vram_gb:.1f} GB | Model file: {plan.file_size_gb:.1f} GB")
+        console.print(
+            f"  Context: {plan.args['ctx_size']} | KV cache: {plan.args['cache_type_k']}"
+        )
+        console.print(f"  Batch: {plan.args['batch_size']} | GPU layers: {plan.ngl}")
+        console.print(
+            f"\n  [bold]OpenAI-compatible clients:[/] http://{host}:{port}/v1 "
+            "(any non-empty API key)\n"
+        )
+        return
+
+    console.print(f"\n[bold green]Running {plan.model_id}[/]{local_tag}")
+    console.print(f"  Source: {source_label}")
+    console.print(f"  Path: {plan.model_path}")
+    if plan.quant_type:
+        console.print(f"  Quant: {plan.quant_type}")
+    console.print(
+        f"  Context: {plan.args['ctx_size']} | KV cache: {plan.args['cache_type_k']}"
+    )
+    console.print(
+        f"  GPU Layers: {plan.ngl} | Model: {plan.file_size_gb:.1f} GB "
+        f"| VRAM: {vram_gb:.1f} GB\n"
+    )
+
+
+# Heuristic: families known to support tool/function calling in llama.cpp + --jinja.
+_TOOL_CALLING_FAMILY_HINTS = frozenset(
+    {
+        "qwen2.5",
+        "qwen3",
+        "hermes",
+        "llama-3.1",
+        "llama-3.2",
+        "llama-3.3",
+        "mistral-nemo",
+        "mistral-small",
+    }
+)
+
+
+def _is_known_tool_calling_family(model_id: str) -> bool:
+    lower = model_id.lower()
+    return any(hint in lower for hint in _TOOL_CALLING_FAMILY_HINTS)
+
+
+def _warn_tool_calling_if_unverified(result) -> None:
+    if not _is_known_tool_calling_family(result.model.id):
+        console.print("[dim]Nota: tool-calling non verificato per questa famiglia.[/]")
+
+
+def _launch_from_plan(
+    result,
+    hardware,
+    local_models,
+    target: str,
+    context_length: int,
+    cpu_only: bool,
+    host: str = "localhost",
+    port: int = 8000,
+) -> None:
+    from whichllm.engine.launch_plan import execute_launch_plan, make_launch_plan
+
+    _attach_local_flag(result, local_models)
+    plan = make_launch_plan(
+        result, hardware, target, local_models, context_length, cpu_only
+    )
+    _print_launch_plan(plan, hardware, host=host, port=port)
+
+    if plan.runtime == "error":
+        console.print(f"[red]{plan.error}[/]")
+        raise typer.Exit(code=1)
+
+    if plan.runtime == "uv_fallback":
+        if target == "chat":
+            console.print(
+                "[yellow]llama-cli.exe not found — falling back to llama-cpp-python "
+                "(may be CPU-only on Windows).[/]"
+            )
+            console.print(
+                "[dim]Install llama.cpp or set WHICHLLM_LLAMA_DIR for native GPU chat.[/]"
+            )
+        else:
+            console.print(
+                "[yellow]llama-server.exe not found — falling back to llama-cpp-python "
+                "(may be CPU-only on Windows).[/]"
+            )
+            console.print(
+                "[dim]Install llama.cpp or set WHICHLLM_LLAMA_DIR for native GPU serving.[/]"
+            )
+
+    code = execute_launch_plan(
+        plan,
+        host=host,
+        port=port,
+        context_length=context_length,
+        cpu_only=cpu_only,
+    )
+    raise typer.Exit(code=code)
+
+
 @app.command()
 def run(
     model_name: Optional[str] = typer.Argument(
@@ -871,21 +1212,76 @@ def run(
     ),
     refresh: bool = typer.Option(False, "--refresh", help="Ignore cache"),
     cpu_only: bool = typer.Option(False, "--cpu-only", help="CPU-only mode"),
+    local: bool = typer.Option(
+        False, "--local", "-l", help="Run a local model file instead of HuggingFace"
+    ),
+    models_dir: str = typer.Option(
+        None,
+        "--models-dir",
+        "-d",
+        help="Directory containing local models (default: ~/models or WHICHLLM_MODELS_DIR)",
+    ),
 ):
     """Download and chat with a model. Picks the best one if none specified."""
-    import os
-    import shutil
-    import subprocess
-    import tempfile
+    from whichllm.models.local import default_models_dir
 
-    if not shutil.which("uv"):
-        console.print("[red]uv is required.[/]")
-        console.print(
-            "Install: [bold]curl -LsSf https://astral.sh/uv/install.sh | sh[/]"
+    models_dir = models_dir or default_models_dir()
+
+    # --- Local model path (native llama-cli with GPU) ---
+    if local:
+        from whichllm.hardware.detector import detect_hardware
+        from whichllm.models.local import format_size, scan_local_models
+
+        local_models = scan_local_models(models_dir)
+        if not local_models:
+            console.print(f"[red]No models found in {models_dir}[/]")
+            raise typer.Exit(code=1)
+
+        if model_name:
+            query = model_name.lower()
+            matches = [m for m in local_models if query in m.name.lower()]
+            if not matches:
+                console.print(f"[red]No local model matching '{model_name}'[/]")
+                raise typer.Exit(code=1)
+            selected = matches[0]
+        else:
+            console.print(f"\n[bold]Local models in {models_dir}:[/]\n")
+            for i, m in enumerate(local_models, 1):
+                size_str = format_size(m.size_bytes)
+                tag = " [dim](GGUF)[/]" if m.is_gguf else ""
+                quant_tag = f" [cyan]{m.quant_type}[/]" if m.quant_type else ""
+                console.print(f"  {i}. {m.name}{tag}{quant_tag} [dim]{size_str}[/]")
+            console.print()
+            choice = typer.prompt(
+                "Select model number (or press Enter for best)",
+                default="1",
+                value_proc=lambda x: int(x) - 1 if x.strip() else 0,
+                show_default=False,
+            )
+            if isinstance(choice, int) and 0 <= choice < len(local_models):
+                selected = local_models[choice]
+            else:
+                selected = local_models[0]
+
+        hardware = detect_hardware()
+        if cpu_only:
+            hardware.gpus = []
+        _launch_from_plan(
+            _compatibility_from_local(selected),
+            hardware,
+            local_models,
+            target="chat",
+            context_length=context_length,
+            cpu_only=cpu_only,
         )
-        raise typer.Exit(code=1)
 
+    # --- HuggingFace model path (original flow) ---
     from rich.progress import Progress, SpinnerColumn, TextColumn
+    from whichllm.engine.types import CompatibilityResult
+    from whichllm.hardware.detector import detect_hardware
+    from whichllm.models.local import scan_local_models
+
+    local_models = scan_local_models(models_dir)
 
     with Progress(
         SpinnerColumn(),
@@ -897,18 +1293,40 @@ def run(
         models = _load_models(refresh)
         progress.remove_task(task)
 
-    variant = None
+    hardware = detect_hardware()
+    if cpu_only:
+        hardware.gpus = []
+
+    launch_result: CompatibilityResult | None = None
     if model_name:
         model = _search_model(models, model_name)
+        resolved = _resolve_gguf_runtime(model, models, quant)
+        if not resolved:
+            console.print(f"[red]No GGUF variant available for {model.id}.[/]")
+            console.print(
+                "[dim]Try a GGUF repo name, e.g. "
+                '`whichllm run "qwen3 14b gguf"`, or use --local with a .gguf file.[/]'
+            )
+            raise typer.Exit(code=1)
+        resolved_model, variant = resolved
+        if resolved_model.id != model.id:
+            console.print(
+                "[dim]Resolved GGUF runtime: "
+                f"{model.id} -> {resolved_model.id} "
+                f"({variant.quant_type})[/]"
+            )
+        launch_result = CompatibilityResult(
+            model=resolved_model,
+            gguf_variant=variant,
+            can_run=True,
+            vram_required_bytes=0,
+            vram_available_bytes=0,
+        )
     else:
         from whichllm.engine.ranker import rank_models
-        from whichllm.hardware.detector import detect_hardware
         from whichllm.models.benchmark import load_benchmark_cache
         from whichllm.models.grouper import group_models
 
-        hardware = detect_hardware()
-        if cpu_only:
-            hardware.gpus = []
         bench_scores = load_benchmark_cache() or {}
         families = group_models(models)
         all_models = []
@@ -916,6 +1334,9 @@ def run(
             all_models.append(family.base_model)
             all_models.extend(family.variants)
 
+        available_locally = (
+            {m.family_id for m in local_models if m.family_id} or None
+        )
         results = rank_models(
             all_models,
             hardware,
@@ -923,35 +1344,29 @@ def run(
             top_n=5,
             quant_filter=quant,
             benchmark_scores=bench_scores,
+            available_locally=available_locally,
         )
         if not results:
             console.print("[red]No runnable model found for your hardware.[/]")
             raise typer.Exit(code=1)
+
         skipped_gguf: list[str] = []
-        model = None
         for ranked in results:
             if ranked.gguf_variant:
-                resolved = _resolve_ranked_gguf_for_run(
-                    ranked.model,
-                    ranked.gguf_variant,
-                    all_models,
-                    quant_filter=quant,
-                )
+                resolved = _resolve_launch_result(ranked, all_models, quant)
                 if resolved:
-                    resolved_model, variant = resolved
-                    if resolved_model.id != ranked.model.id:
+                    if resolved.model.id != ranked.model.id:
                         console.print(
                             "[dim]Resolved GGUF runtime: "
-                            f"{ranked.model.id} -> {resolved_model.id} "
-                            f"({variant.quant_type})[/]"
+                            f"{ranked.model.id} -> {resolved.model.id} "
+                            f"({resolved.gguf_variant.quant_type})[/]"
                         )
-                    model = resolved_model
-                    quant = variant.quant_type
+                    launch_result = resolved
                     break
                 skipped_gguf.append(ranked.model.id)
                 continue
 
-            model = ranked.model
+            launch_result = ranked
             break
 
         if skipped_gguf:
@@ -961,38 +1376,43 @@ def run(
                 "[yellow]Warning:[/] Skipped GGUF-ranked candidate(s) without "
                 f"a matching runnable GGUF repo: {skipped}{suffix}"
             )
-        if model is None:
-            console.print(
-                "[red]Error:[/] Top recommendations require GGUF builds, "
-                "but no matching GGUF repos were found."
-            )
-            console.print(
-                "[dim]Try specifying a GGUF model explicitly, for example "
-                '`whichllm run "qwen gguf"`.[/]'
-            )
-            raise typer.Exit(code=1)
 
-    if variant is None:
-        variant = _pick_gguf_variant(model, quant)
-    deps, script_type = _resolve_model_deps(model, variant)
-    script = _generate_chat_script(model, variant, context_length, cpu_only)
+    if launch_result is None:
+        console.print(
+            "[red]Error:[/] Top recommendations require GGUF builds, "
+            "but no matching GGUF repos were found."
+        )
+        console.print(
+            "[dim]Try specifying a GGUF model explicitly, for example "
+            '`whichllm run "qwen gguf"`.[/]'
+        )
+        raise typer.Exit(code=1)
 
-    fmt = variant.quant_type if variant else script_type.upper()
-    console.print(f"\n[bold green]Running {model.id}[/] [dim]({fmt})[/]")
-    console.print(f"[dim]Setting up isolated env with: {', '.join(deps)}[/]\n")
+    if launch_result.gguf_variant is None:
+        variant = _pick_gguf_variant(launch_result.model, quant)
+        if variant:
+            from dataclasses import replace
 
-    fd, script_path = tempfile.mkstemp(suffix=".py", prefix="whichllm_run_")
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(script)
-        cmd = ["uv", "run", "--no-project"]
-        for dep in deps:
-            cmd.extend(["--with", dep])
-        cmd.append(script_path)
-        result = subprocess.run(cmd)
-        raise typer.Exit(code=result.returncode)
-    finally:
-        os.unlink(script_path)
+            launch_result = replace(launch_result, gguf_variant=variant)
+
+    if not launch_result.gguf_variant:
+        console.print(
+            f"[red]No GGUF variant available for {launch_result.model.id}.[/]"
+        )
+        console.print(
+            "[dim]Try a GGUF repo name, e.g. "
+            '`whichllm run "qwen3 14b gguf"`, or use --local with a .gguf file.[/]'
+        )
+        raise typer.Exit(code=1)
+
+    _launch_from_plan(
+        launch_result,
+        hardware,
+        local_models,
+        target="chat",
+        context_length=context_length,
+        cpu_only=cpu_only,
+    )
 
 
 @app.command()
@@ -1105,6 +1525,256 @@ def hardware(
     console.print()
     display_hardware(hw)
     console.print()
+
+
+@app.command()
+def local_model(
+    models_dir: str = typer.Option(
+        None,
+        "--models-dir",
+        "-d",
+        help="Directory containing local models (default: ~/models or WHICHLLM_MODELS_DIR)",
+    ),
+    list_only: bool = typer.Option(
+        False, "--list", help="Only list available models without activating"
+    ),
+):
+    """List local models and show the best one for your hardware."""
+    from whichllm.models.local import default_models_dir, format_size, scan_local_models
+
+    models_dir = models_dir or default_models_dir()
+
+    console.print(f"\n[bold]Scanning:[/] {models_dir}")
+    models = scan_local_models(models_dir)
+
+    if not models:
+        console.print(f"[yellow]No models found in {models_dir}[/]")
+        console.print("[dim]Supported formats: .gguf, .bin, .safetensors[/]")
+        raise typer.Exit(code=1)
+
+    console.print(f"[green]Found {len(models)} model(s):[/]\n")
+
+    # Display models
+    for i, model in enumerate(models, 1):
+        size_str = format_size(model.size_bytes)
+        gguf_tag = " [dim](GGUF)[/]" if model.is_gguf else ""
+        quant_tag = f" [cyan]{model.quant_type}[/]" if model.quant_type else ""
+        console.print(
+            f"  {i}. {model.name}{gguf_tag}{quant_tag} [dim]{size_str}[/]"
+        )
+
+    if list_only:
+        return
+
+    # Select best model (largest = most capable for local deployment)
+    best = models[0]
+
+    console.print(f"\n[bold green]Best model:[/] {best.name}")
+    console.print(f"[dim]Size: {format_size(best.size_bytes)}[/]")
+
+    # Detect hardware for VRAM info
+    from whichllm.hardware.detector import detect_hardware
+
+    hw = detect_hardware()
+
+    total_vram = sum(g.vram_bytes for g in hw.gpus) if hw.gpus else 0
+    total_vram_gb = total_vram / (1024**3)
+    if hw.gpus:
+        console.print(f"[dim]Available VRAM: {total_vram_gb:.1f} GB[/]")
+
+    # Print model configuration
+    console.print("\n[bold]Model Configuration:[/]")
+    console.print(f"  Name: {best.name}")
+    console.print(f"  Path: {best.path}")
+
+    if best.quant_type:
+        console.print(f"  Quant: {best.quant_type}")
+
+    if best.is_gguf:
+        from whichllm.engine.quantization import estimate_vram_gguf_approx
+
+        estimated_ram = estimate_vram_gguf_approx(best.size_bytes, best.quant_type or "Q4_K_M")
+        console.print(f"  Estimated RAM usage: {format_size(int(estimated_ram))}")
+
+    console.print("\n[dim]Tip: use the model path to configure any OpenAI-compatible client.[/]")
+
+
+@app.command()
+def serve(
+    model_name: Optional[str] = typer.Argument(
+        None, help="Model name/path (from list or HF). Omit for interactive selection."
+    ),
+    context_length: int = typer.Option(
+        32768,
+        "--context-length",
+        "-c",
+        click_type=CONTEXT_LENGTH,
+        help="Context length (default 32k, adatto a IDE/agenti come Cline).",
+    ),
+    host: str = typer.Option(
+        "localhost", "--host", "-H", help="Host to bind the server to"
+    ),
+    port: int = typer.Option(
+        8000, "--port", "-p", help="Port to bind the server to"
+    ),
+    local: bool = typer.Option(
+        False, "--local", "-l", help="Pick from local models instead of HuggingFace"
+    ),
+    models_dir: str = typer.Option(
+        None,
+        "--models-dir",
+        "-d",
+        help="Directory with local models (default: ~/models or WHICHLLM_MODELS_DIR)",
+    ),
+    refresh: bool = typer.Option(
+        False, "--refresh", help="Ignore cache and re-fetch from HuggingFace"
+    ),
+    cpu_only: bool = typer.Option(
+        False, "--cpu-only", help="Run model on CPU only"
+    ),
+):
+    """Start an OpenAI-compatible API server with a local or HF model.
+
+    When ``llama-server`` is available, HuggingFace GGUF models are downloaded
+    and served with native GPU acceleration. Falls back to ``llama-cpp-python``
+    via ``uv`` when the binary is not found.
+
+    Compatible with OpenAI-compatible clients. Set the base URL to
+    ``http://localhost:8000/v1`` by default.
+    """
+    from rich.progress import Progress, SpinnerColumn, TextColumn
+    from whichllm.engine.types import CompatibilityResult
+    from whichllm.hardware.detector import detect_hardware
+    from whichllm.models.local import default_models_dir, format_size, scan_local_models
+
+    models_dir = models_dir or default_models_dir()
+    local_models = scan_local_models(models_dir)
+    hardware = detect_hardware()
+    if cpu_only:
+        hardware.gpus = []
+
+    launch_result: CompatibilityResult | None = None
+
+    if local:
+        if not local_models:
+            console.print(f"[red]No models found in {models_dir}[/]")
+            raise typer.Exit(code=1)
+
+        if model_name:
+            query = model_name.lower()
+            matches = [m for m in local_models if query in m.name.lower()]
+            if not matches:
+                console.print(
+                    f"[red]No local model matching '{model_name}' in {models_dir}[/]"
+                )
+                raise typer.Exit(code=1)
+            selected = matches[0]
+        else:
+            console.print(f"\n[bold]Local models in {models_dir}:[/]\n")
+            for i, m in enumerate(local_models, 1):
+                size_str = format_size(m.size_bytes)
+                tag = " [dim](GGUF)[/]" if m.is_gguf else ""
+                quant_tag = f" [cyan]{m.quant_type}[/]" if m.quant_type else ""
+                console.print(f"  {i}. {m.name}{tag}{quant_tag} [dim]{size_str}[/]")
+            console.print()
+            choice = typer.prompt(
+                "Select model number (or press Enter for best)",
+                default="1",
+                value_proc=lambda x: int(x) - 1 if x.strip() else 0,
+                show_default=False,
+            )
+            if isinstance(choice, int) and 0 <= choice < len(local_models):
+                selected = local_models[choice]
+            else:
+                selected = local_models[0]
+
+        console.print(f"\n[bold green]Selected:[/] {selected.name}")
+        console.print(f"  Path: {selected.path}")
+        if selected.quant_type:
+            console.print(f"  Quant: {selected.quant_type}")
+        console.print(f"  Size: {format_size(selected.size_bytes)}")
+        launch_result = _compatibility_from_local(selected)
+
+    elif model_name:
+        models = _load_models(refresh)
+        searched = _search_model(models, model_name)
+        resolved = _resolve_gguf_runtime(searched, models, None)
+        if not resolved:
+            console.print(f"[red]No GGUF variant available for {searched.id}[/]")
+            console.print(
+                "[dim]Try a GGUF repo, e.g. "
+                '`whichllm serve "qwen3 14b gguf"`, or use --local.[/]'
+            )
+            raise typer.Exit(code=1)
+
+        model, variant = resolved
+        if model.id != searched.id:
+            console.print(
+                "[dim]Resolved GGUF runtime: "
+                f"{searched.id} -> {model.id} ({variant.quant_type})[/]"
+            )
+        launch_result = CompatibilityResult(
+            model=model,
+            gguf_variant=variant,
+            can_run=True,
+            vram_required_bytes=0,
+            vram_available_bytes=0,
+        )
+
+    else:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+            transient=True,
+        ) as progress:
+            task = progress.add_task("Finding best model for your hardware...", total=None)
+
+            models = _load_models(refresh)
+            from whichllm.engine.ranker import rank_models
+            from whichllm.models.benchmark import load_benchmark_cache
+            from whichllm.models.grouper import group_models
+
+            bench_scores = load_benchmark_cache() or {}
+            families = group_models(models)
+            all_models = []
+            for family in families:
+                all_models.append(family.base_model)
+                all_models.extend(family.variants)
+
+            available_locally = (
+                {m.family_id for m in local_models if m.family_id} or None
+            )
+            results = rank_models(
+                all_models,
+                hardware,
+                context_length=context_length,
+                top_n=5,
+                benchmark_scores=bench_scores,
+                available_locally=available_locally,
+            )
+            progress.remove_task(task)
+
+        if not results:
+            console.print("[red]No model found for your hardware.[/]")
+            raise typer.Exit(code=1)
+
+        launch_result = _pick_first_ranked_gguf_result(results, all_models, None)
+        if not launch_result:
+            console.print("[red]No GGUF variant available for the best candidate.[/]")
+            raise typer.Exit(code=1)
+
+    _warn_tool_calling_if_unverified(launch_result)
+    _launch_from_plan(
+        launch_result,
+        hardware,
+        local_models,
+        target="server",
+        context_length=context_length,
+        cpu_only=cpu_only,
+        host=host,
+        port=port,
+    )
 
 
 if __name__ == "__main__":

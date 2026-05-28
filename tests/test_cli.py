@@ -12,15 +12,18 @@ from whichllm.cli import (
     _merge_model_eval_benchmarks,
     _pick_gguf_variant,
     _resolve_ranked_gguf_for_run,
+    _resolve_gguf_runtime,
     _resolve_evidence_mode,
     _search_model,
     _validate_evidence,
     app,
 )
 from whichllm.utils import _current_version
+from whichllm.engine.llama_binary import FoundBinaries
 from whichllm.engine.types import CompatibilityResult
 from whichllm.hardware.types import GPUInfo, HardwareInfo
 from whichllm.models.types import GGUFVariant, ModelInfo
+import typer
 from typer.testing import CliRunner
 
 
@@ -469,6 +472,38 @@ def test_resolve_ranked_synthetic_gguf_rejects_size_mismatch():
 # --------------- run/snippet command tests ---------------
 
 
+def test_resolve_gguf_runtime_finds_gguf_sibling():
+    official = ModelInfo(
+        id="Qwen/Qwen3-14B",
+        family_id="qwen3-14b",
+        name="Qwen3-14B",
+        parameter_count=14_800_000_000,
+        downloads=2_000_000,
+    )
+    gguf_repo = ModelInfo(
+        id="unsloth/Qwen3-14B-GGUF",
+        family_id="qwen3-14b",
+        name="Qwen3-14B-GGUF",
+        parameter_count=14_800_000_000,
+        downloads=500_000,
+        base_model="Qwen/Qwen3-14B",
+        gguf_variants=[
+            GGUFVariant(
+                filename="Q4_K_M.gguf",
+                quant_type="Q4_K_M",
+                file_size_bytes=9_000_000_000,
+            )
+        ],
+    )
+
+    resolved = _resolve_gguf_runtime(official, [official, gguf_repo], "Q4_K_M")
+
+    assert resolved is not None
+    model, variant = resolved
+    assert model.id == "unsloth/Qwen3-14B-GGUF"
+    assert variant.quant_type == "Q4_K_M"
+
+
 def test_run_exits_gracefully():
     """run should fail gracefully (uv missing, or no model found)."""
     runner = CliRunner()
@@ -547,36 +582,83 @@ def test_run_auto_pick_resolves_ranked_gguf_before_launch(monkeypatch):
             )
         ]
 
-    def fake_generate_chat_script(model, variant, context_length, cpu_only):
-        captured["model_id"] = model.id
-        captured["variant"] = variant
-        return "print('ok')"
-
-    class Completed:
-        returncode = 0
-
-    def fake_run(cmd):
-        captured["cmd"] = cmd
-        return Completed()
+    def fake_execute(plan, **kwargs):
+        captured["plan"] = plan
+        return 0
 
     monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/uv")
+    monkeypatch.setattr(
+        "whichllm.engine.launch_plan.find_binaries",
+        lambda: FoundBinaries(cli=None, server=None),
+    )
     monkeypatch.setattr(cli_mod, "_load_models", lambda refresh: [selected, real_gguf])
     monkeypatch.setattr(
         "whichllm.hardware.detector.detect_hardware", lambda: _hw_with_gpu(8)
     )
     monkeypatch.setattr("whichllm.models.benchmark.load_benchmark_cache", lambda: {})
+    monkeypatch.setattr("whichllm.models.local.scan_local_models", lambda _: [])
     monkeypatch.setattr("whichllm.engine.ranker.rank_models", fake_rank_models)
-    monkeypatch.setattr(cli_mod, "_generate_chat_script", fake_generate_chat_script)
-    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "whichllm.engine.launch_plan.execute_launch_plan", fake_execute
+    )
 
     result = CliRunner().invoke(app, ["run", "--quant", "Q4_K_M"])
 
     assert result.exit_code == 0
     assert captured["quant_filter"] == "Q4_K_M"
-    assert captured["model_id"] == "unsloth/Qwen3.6-27B-GGUF"
-    assert captured["variant"].filename == "q4.gguf"
-    assert "llama-cpp-python" in captured["cmd"]
-    assert "transformers" not in captured["cmd"]
+    plan = captured["plan"]
+    assert plan.model_id == "unsloth/Qwen3.6-27B-GGUF"
+    assert plan.model_path == "q4.gguf"
+    assert plan.runtime == "uv_fallback"
+
+
+def test_run_hf_gguf_uses_native_llama_cli_when_available(monkeypatch, tmp_path):
+    model = ModelInfo(
+        id="Qwen/Qwen2.5-1.5B-Instruct-GGUF",
+        family_id="qwen2.5",
+        name="Qwen2.5-1.5B",
+        parameter_count=1_500_000_000,
+        downloads=100_000,
+        gguf_variants=[
+            GGUFVariant(
+                filename="model.q4.gguf",
+                quant_type="Q4_K_M",
+                file_size_bytes=1_000_000_000,
+            )
+        ],
+    )
+    gguf_file = tmp_path / "model.q4.gguf"
+    gguf_file.write_bytes(b"x" * 1024)
+    captured: dict[str, object] = {}
+
+    class Completed:
+        returncode = 0
+
+    def fake_execute(plan, **kwargs):
+        captured["plan"] = plan
+        if plan.needs_download:
+            captured["download"] = (plan.model_id, plan.model_path)
+        return 0
+
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/uv")
+    monkeypatch.setattr(cli_mod, "_load_models", lambda refresh: [model])
+    monkeypatch.setattr("whichllm.models.local.scan_local_models", lambda _: [])
+    monkeypatch.setattr(
+        "whichllm.engine.launch_plan.find_binaries",
+        lambda: FoundBinaries(cli=tmp_path / "llama-cli.exe", server=None),
+    )
+    monkeypatch.setattr(
+        "whichllm.engine.launch_plan.execute_launch_plan", fake_execute
+    )
+
+    result = CliRunner().invoke(app, ["run", "qwen 2.5 1.5b gguf"])
+
+    assert result.exit_code == 0
+    assert captured["download"] == ("Qwen/Qwen2.5-1.5B-Instruct-GGUF", "model.q4.gguf")
+    plan = captured["plan"]
+    assert plan.runtime == "native"
+    assert plan.ngl == 99
+    assert plan.model_id == "Qwen/Qwen2.5-1.5B-Instruct-GGUF"
 
 
 def test_snippet_no_model_found():
@@ -638,3 +720,40 @@ def test_json_output_includes_benchmark_source_and_confidence():
     assert entry["benchmark_status"] == "estimated"
     assert entry["benchmark_source"] == "line_interp"
     assert entry["benchmark_confidence"] == 0.34
+
+
+def test_serve_default_context_is_32k(monkeypatch):
+    captured: dict[str, int] = {}
+    model = ModelInfo(
+        id="Qwen/Qwen3-8B",
+        family_id="qwen3-8b",
+        name="Qwen3-8B",
+        parameter_count=8_000_000_000,
+        context_length=131072,
+        downloads=1000,
+        likes=100,
+        gguf_variants=[
+            GGUFVariant(
+                filename="qwen3-8b-Q4_K_M.gguf",
+                quant_type="Q4_K_M",
+                file_size_bytes=4_500_000_000,
+            )
+        ],
+    )
+
+    def fake_launch(*args, **kwargs):
+        captured["context_length"] = kwargs["context_length"]
+        raise typer.Exit(0)
+
+    monkeypatch.setattr(cli_mod, "_launch_from_plan", fake_launch)
+    monkeypatch.setattr(cli_mod, "_warn_tool_calling_if_unverified", lambda _r: None)
+    monkeypatch.setattr(cli_mod, "_load_models", lambda refresh: [model])
+    monkeypatch.setattr("whichllm.models.local.scan_local_models", lambda _: [])
+    monkeypatch.setattr(
+        "whichllm.hardware.detector.detect_hardware", lambda: _hw_with_gpu(24)
+    )
+
+    result = CliRunner().invoke(app, ["serve", "qwen3 8b", "--cpu-only"])
+
+    assert result.exit_code == 0
+    assert captured["context_length"] == 32768

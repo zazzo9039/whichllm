@@ -149,17 +149,81 @@ Options:
 | `--quant`, `-q` | Preferred GGUF quantization |
 | `--refresh` | Ignore model cache and fetch again |
 | `--cpu-only` | Force CPU-only execution in the generated script |
+| `--local`, `-l` | Use a GGUF file from a local directory instead of HuggingFace |
+| `--models-dir`, `-d` | Local models directory (default: `~/models` or `WHICHLLM_MODELS_DIR`) |
+
+When `llama-cli` is available on the system, GGUF models downloaded from
+HuggingFace are launched through the native binary with GPU auto-tuning.
+Set `WHICHLLM_LLAMA_DIR` to point at a directory containing
+`llama-cli.exe` / `llama-server.exe`. Without the binary, whichllm falls
+back to an isolated `llama-cpp-python` run via `uv` (often CPU-only on
+Windows wheels).
 
 Examples:
 
 ```bash
 whichllm run
 whichllm run "qwen 2.5 1.5b gguf"
+whichllm run --local --models-dir C:/models
 whichllm run "phi 3 mini gguf" --cpu-only
 whichllm run "mistral 7b gguf" --context-length 64k
 ```
 
-`run` requires `uv` in `PATH`.
+`run` requires `uv` in `PATH` for HuggingFace downloads.
+
+## `serve`
+
+```bash
+whichllm serve [MODEL_NAME] [OPTIONS]
+```
+
+Starts an OpenAI-compatible HTTP server (`/v1/models`, `/v1/chat/completions`,
+`/v1/completions`). When `llama-server` is available, HuggingFace GGUF models
+are downloaded and served with native GPU acceleration. Without the binary,
+whichllm falls back to a generated FastAPI script via `uv`.
+
+Options:
+
+| Option | Meaning |
+| --- | --- |
+| `--context-length`, `-c` | Context length passed to the runtime. Default: `32768` (32k, adatto a IDE/agenti come Cline) |
+| `--host`, `-H` | Bind host. Default: `localhost` |
+| `--port`, `-p` | Bind port. Default: `8000` |
+| `--local`, `-l` | Pick a GGUF from a local directory instead of HuggingFace |
+| `--models-dir`, `-d` | Local models directory (default: `~/models` or `WHICHLLM_MODELS_DIR`) |
+| `--refresh` | Ignore model cache and fetch again |
+| `--cpu-only` | Disable GPU layer offload |
+
+Examples:
+
+```bash
+whichllm serve
+whichllm serve "qwen3 14b" -p 8081 -H 127.0.0.1
+whichllm serve --local --models-dir C:/models
+```
+
+`serve` usa **32k** di context di default; per chat interattiva `run` resta a 4096.
+
+## `local-model`
+
+```bash
+whichllm local-model [OPTIONS]
+```
+
+Lists GGUF and other weight files in a local directory and prints
+configuration hints for the largest model found.
+
+| Option | Meaning |
+| --- | --- |
+| `--models-dir`, `-d` | Directory to scan (default: `~/models` or `WHICHLLM_MODELS_DIR`) |
+| `--list` | Only list models, skip the best-model summary |
+
+Examples:
+
+```bash
+whichllm local-model --list
+whichllm local-model --models-dir C:/models
+```
 
 ## `snippet`
 
