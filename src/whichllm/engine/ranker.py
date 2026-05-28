@@ -61,7 +61,11 @@ def _family_selection_key(
         direct_bonus = 5.0
     else:
         direct_bonus = 0.0
-    return (result.quality_score + fit_bonus + direct_bonus,)
+    local_bonus = 2.5 if result.is_local else 0.0
+    ctx_penalty = -20.0 if not result.context_fits else 0.0
+    return (
+        result.quality_score + fit_bonus + direct_bonus + local_bonus + ctx_penalty,
+    )
 
 
 # Per-source benchmark weight applied to the raw 0-100 score before it is
@@ -604,6 +608,7 @@ def rank_models(
     require_direct_top: bool = True,
     min_params_b: float | None = None,
     evidence_filter: str = "any",
+    available_locally: set[str] | None = None,
 ) -> list[CompatibilityResult]:
     """Rank models by quality for the given hardware. Returns top N results."""
     results: list[CompatibilityResult] = []
@@ -767,6 +772,12 @@ def rank_models(
 
         if best_for_model is None:
             continue
+
+        if (
+            available_locally
+            and best_for_model.model.family_id in available_locally
+        ):
+            best_for_model.is_local = True
 
         # Deduplicate by family: keep the one with highest quality score
         family_key = model.family_id

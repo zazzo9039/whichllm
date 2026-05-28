@@ -672,3 +672,162 @@ def test_benchmark_source_and_confidence_exposed_for_none():
     assert results[0].benchmark_status == "none"
     assert results[0].benchmark_source == "none"
     assert results[0].benchmark_confidence == 0.0
+
+
+def _make_rankable_pair() -> tuple[list[ModelInfo], dict[str, float], HardwareInfo]:
+    """Two 8B models with close quality scores for local-bonus tests."""
+    models = [
+        ModelInfo(
+            id="org/ModelA-8B",
+            family_id="modela-8b",
+            name="ModelA-8B",
+            parameter_count=8_000_000_000,
+            downloads=1000,
+            likes=100,
+            gguf_variants=[
+                GGUFVariant(
+                    filename="a-Q4_K_M.gguf",
+                    quant_type="Q4_K_M",
+                    file_size_bytes=4_500_000_000,
+                ),
+            ],
+        ),
+        ModelInfo(
+            id="org/ModelB-8B",
+            family_id="modelb-8b",
+            name="ModelB-8B",
+            parameter_count=8_000_000_000,
+            downloads=900,
+            likes=90,
+            gguf_variants=[
+                GGUFVariant(
+                    filename="b-Q4_K_M.gguf",
+                    quant_type="Q4_K_M",
+                    file_size_bytes=4_500_000_000,
+                ),
+            ],
+        ),
+    ]
+    scores = {
+        "org/ModelA-8B": 76.0,
+        "org/ModelB-8B": 74.0,
+    }
+    return models, scores, _make_hardware(bandwidth_gbps=900.0)
+
+
+def test_rank_models_local_bonus_reorders():
+    models, scores, hw = _make_rankable_pair()
+
+    default = rank_models(
+        models,
+        hw,
+        top_n=2,
+        benchmark_scores=scores,
+        require_direct_top=False,
+        task_profile="any",
+    )
+    with_local = rank_models(
+        models,
+        hw,
+        top_n=2,
+        benchmark_scores=scores,
+        require_direct_top=False,
+        task_profile="any",
+        available_locally={"modelb-8b"},
+    )
+
+    assert [r.model.family_id for r in default] == ["modela-8b", "modelb-8b"]
+    assert all(not r.is_local for r in default)
+
+    assert [r.model.family_id for r in with_local] == ["modelb-8b", "modela-8b"]
+    assert with_local[0].is_local is True
+    assert with_local[1].is_local is False
+
+
+def test_rank_models_default_unchanged_without_available_locally():
+    models, scores, hw = _make_rankable_pair()
+
+    baseline = rank_models(
+        models,
+        hw,
+        top_n=2,
+        benchmark_scores=scores,
+        require_direct_top=False,
+        task_profile="any",
+    )
+    explicit_none = rank_models(
+        models,
+        hw,
+        top_n=2,
+        benchmark_scores=scores,
+        require_direct_top=False,
+        task_profile="any",
+        available_locally=None,
+    )
+
+    assert [r.model.id for r in baseline] == [r.model.id for r in explicit_none]
+    assert [r.quality_score for r in baseline] == [r.quality_score for r in explicit_none]
+    assert all(not r.is_local for r in baseline)
+    assert all(not r.is_local for r in explicit_none)
+
+
+def _make_context_rankable_pair() -> tuple[list[ModelInfo], dict[str, float], HardwareInfo]:
+    """Two 8B models: higher-score one lacks 32k context."""
+    models = [
+        ModelInfo(
+            id="org/LongCtx-8B",
+            family_id="longctx-8b",
+            name="LongCtx-8B",
+            parameter_count=8_000_000_000,
+            context_length=131072,
+            downloads=900,
+            likes=90,
+            gguf_variants=[
+                GGUFVariant(
+                    filename="long-Q4_K_M.gguf",
+                    quant_type="Q4_K_M",
+                    file_size_bytes=4_500_000_000,
+                ),
+            ],
+        ),
+        ModelInfo(
+            id="org/ShortCtx-8B",
+            family_id="shortctx-8b",
+            name="ShortCtx-8B",
+            parameter_count=8_000_000_000,
+            context_length=8192,
+            downloads=1000,
+            likes=100,
+            gguf_variants=[
+                GGUFVariant(
+                    filename="short-Q4_K_M.gguf",
+                    quant_type="Q4_K_M",
+                    file_size_bytes=4_500_000_000,
+                ),
+            ],
+        ),
+    ]
+    scores = {
+        "org/LongCtx-8B": 74.0,
+        "org/ShortCtx-8B": 76.0,
+    }
+    return models, scores, _make_hardware(bandwidth_gbps=900.0)
+
+
+def test_ctx_penalty_demotes_non_fitting():
+    models, scores, hw = _make_context_rankable_pair()
+
+    results = rank_models(
+        models,
+        hw,
+        context_length=32768,
+        top_n=2,
+        benchmark_scores=scores,
+        require_direct_top=False,
+        task_profile="any",
+    )
+
+    assert len(results) == 2
+    assert results[0].model.family_id == "longctx-8b"
+    assert results[0].context_fits is True
+    assert results[1].context_fits is False
